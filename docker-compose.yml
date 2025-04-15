@@ -1,0 +1,77 @@
+services:
+  cluster-master:
+    environment:
+      # - SPARK_DRIVER_MEMORY=2g
+      # - SPARK_EXECUTOR_MEMORY=2g
+      - HADOOP_HEAPSIZE=512m
+      - YARN_RESOURCEMANAGER_HEAPSIZE=256m
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -report && yarn node -list"]
+      interval: 30s
+      timeout: 20s
+      start_period: 2m
+      retries: 3
+    image: firasj/spark-docker-cluster
+    container_name: cluster-master
+    ports:
+      - "8088:8088"
+      - "4040:4040"
+      - "19888:19888"
+      - "9000:9000"
+      - "9870:9870"
+    volumes:
+      - "./app:/app"
+    networks:
+      - spark-cluster
+    depends_on:
+      - cluster-slave-1
+      - cassandra-server
+    hostname: cluster-master
+    tty: true
+    working_dir: /app
+    # You can comment the entrypoint to run the script manually inside the container
+    entrypoint: 
+      - bash
+      - /app/app.sh
+    
+  cluster-slave-1:
+    image: firasj/spark-docker-cluster
+    container_name: cluster-slave-1
+    networks:
+      - spark-cluster
+    hostname: cluster-slave-1
+    tty: true
+  # cluster-slave-2:
+  #   image: firasj/spark-docker-cluster
+  #   container_name: cluster-slave-2
+  #   networks:
+  #     - spark-cluster
+  #   depends_on:
+  #     - cluster-slave-1
+  #   hostname: cluster-slave-2
+  #   tty: true
+  cassandra-server:
+    image: cassandra
+    container_name: cassandra-server
+    networks:
+      - spark-cluster
+    environment:
+      - CASSANDRA_CLUSTER_NAME=SearchEngineCluster
+      - CASSANDRA_DC=dc1
+      - CASSANDRA_RACK=rack1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+    ports:
+      - "9042:9042"
+      - "7000:7000"
+      - "7001:7001"
+      - "7199:7199"
+      - "9160:9160"
+    
+
+networks:
+  spark-cluster:
+    driver: bridge
