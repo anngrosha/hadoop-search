@@ -16,4 +16,10 @@ export PYSPARK_DRIVER_PYTHON=$(which python)
 # Python of the excutor (./.venv/bin/python)
 export PYSPARK_PYTHON=./.venv/bin/python
 
-spark-submit --master yarn --archives /app/.venv.tar.gz#.venv --conf spark.executorEnv.PYSPARK_PYTHON=./.venv/bin/python query.py "$QUERY"
+if [[ "$@" == *"--vector"* ]]; then
+    echo "Search with vectors"
+    spark-submit --master yarn --archives /app/.venv.tar.gz#.venv --conf spark.executorEnv.PYSPARK_PYTHON=./.venv/bin/python query.py "$QUERY" --vector
+else
+    echo "Search with BM25"
+    spark-submit --master yarn --archives /app/.venv.tar.gz#.venv --conf spark.executorEnv.PYSPARK_PYTHON=./.venv/bin/python query.py "$QUERY"
+fi

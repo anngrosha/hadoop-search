@@ -33,9 +33,9 @@ bash index.sh
 
 echo "Done indexer"
 
-echo "data science query running"
+echo "Query running"
 
 # Run the ranker
-bash search.sh "data science"
+bash search.sh "dog food"
 
-echo "data science query finished"
+echo "Query finished"

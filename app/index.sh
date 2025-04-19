@@ -19,38 +19,34 @@ fi
 echo "Using input path: $INPUT_PATH"
 
 
-echo "Term Frequency pipeline"
+hdfs dfs -rm -r /tmp/term_frequencies /tmp/document_frequencies /tmp/combined_output 2>/dev/null || true
 
-hdfs dfs -rm -r -f /tmp/term_frequencies 2>/dev/null || true
-
-hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
+echo "Term Frequency MapReduce"
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
     -files /app/mapreduce/mapper1.py,/app/mapreduce/reducer1.py \
     -mapper "python3 mapper1.py" \
     -reducer "python3 reducer1.py" \
-    -input "$INPUT_PATH" \
+    -input /index/data \
     -output /tmp/term_frequencies
 
-
-echo "Document Frequency pipeline"
-
-hdfs dfs -rm -r -f /tmp/document_frequencies 2>/dev/null || true
-
-hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
-    -files /app/mapreduce/mapper2.py \
+echo "Document Frequency MapReduce"
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+    -files /app/mapreduce/mapper2.py,/app/mapreduce/reducer2.py \
     -mapper "python3 mapper2.py" \
+    -reducer "python3 reducer2.py" \
     -input /tmp/term_frequencies \
     -output /tmp/document_frequencies
-
 
 echo "Loading data into Cassandra"
 
 python3 /app/app.py create_schema
 
-echo "Checking output"
-hdfs dfs -du -h /tmp/term_frequencies
-hdfs dfs -du -h /tmp/document_frequencies
+hdfs dfs -cat /tmp/term_frequencies/part-* /tmp/document_frequencies/part-* | python3 /app/app.py load_data
 
-hdfs dfs -cat /tmp/document_frequencies/* | python3 /app/app.py load_vocabulary
-hdfs dfs -cat /tmp/term_frequencies/* | python3 /app/app.py load_term_index
+if [[ "$@" == *"--vector"* ]]; then
+    echo "Creating vector representations"
+    python3 /app/app.py create_indexes
+    spark-submit --master yarn --archives /app/.venv.tar.gz#.venv vector_indexer.py
+fi
 
 echo "Indexing completed successfully"

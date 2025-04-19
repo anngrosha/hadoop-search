@@ -4,100 +4,157 @@ from cassandra.cluster import Cluster
 import math
 import numpy as np
 from collections import defaultdict
+from cassandra.policies import ExponentialReconnectionPolicy
+from cassandra import ConsistencyLevel
+from cassandra.query import named_tuple_factory, tuple_factory
 
 def safe_divide(numerator, denominator):
     return numerator / denominator if denominator else 0
 
 def calculate_bm25(query, spark_context):
-    # cluster = Cluster(['localhost'])
-    cluster = Cluster(['cassandra-server'])
-    session = cluster.connect('search_engine')
-    print("Connected to cluster for BM25")
-    
-    avg_dl_row = session.execute("SELECT AVG(length) as avg FROM document_stats").one()
-    avg_dl = avg_dl_row.avg if avg_dl_row and avg_dl_row.avg else 1
-    print("avg_dl_row, avg_dl_row.avg: ", avg_dl_row, avg_dl_row.avg)
-    
-    total_docs_row = session.execute("SELECT COUNT(*) as count FROM document_stats").one()
-    total_docs = total_docs_row.count if total_docs_row else 1
-    
-    query_terms = [term.lower() for term in query.split()]
-    doc_scores = defaultdict(float)
-    
-    for term in query_terms:
-        df_row = session.execute("SELECT df FROM vocabulary WHERE term = %s", [term]).one()
-        df = df_row.df if df_row else 0
+    cluster = None
+    try:
+        cluster = Cluster(['cassandra-server'])
+        session = cluster.connect('search_engine')
 
+        stats = session.execute("SELECT avg_doc_length, total_docs FROM corpus_stats WHERE id = 'global'").one()
+        avg_dl = float(stats.avg_doc_length) if stats and stats.avg_doc_length else 1.0
+        N = int(stats.total_docs) if stats and stats.total_docs else 1
+
+        k1 = 1.2
+        b = 0.75
+
+        query_terms = [term.lower() for term in query.split() if term.strip()]
+        if not query_terms:
+            return []
+
+        doc_scores = defaultdict(float)
+        title_cache = {}
+
+        term_dfs = {}
+        for term in query_terms:
+            df_row = session.execute("SELECT df FROM vocabulary WHERE term = %s", [term]).one()
+            term_dfs[term] = int(df_row.df) if df_row else 0
+
+        for term in query_terms:
+            df = term_dfs[term]
+            if df == 0:
+                continue
+
+            idf = max(0, math.log((N - df + 0.5) / (df + 0.5) + 1))
+
+            term_docs = session.execute("""
+                SELECT doc_id, tf, doc_length FROM term_index 
+                WHERE term = %s
+            """, [term])
+
+            for doc in term_docs:
+                doc_id = doc.doc_id
+                tf = int(doc.tf)
+                length = int(doc.doc_length)
+
+                if doc_id not in title_cache:
+                    title_row = session.execute("""
+                        SELECT title FROM document_metadata 
+                        WHERE doc_id = %s
+                    """, [doc_id]).one()
+                    title_cache[doc_id] = title_row.title if title_row else "Untitled"
+
+                numerator = tf * (k1 + 1)
+                denominator = tf + k1 * (1 - b + b * (length / avg_dl))
+                doc_scores[(doc_id, title_cache[doc_id])] += idf * safe_divide(numerator, denominator)
+
+        top_docs = sorted(
+            ((doc_id, title, score) for (doc_id, title), score in doc_scores.items()),
+            key=lambda x: x[2], 
+            reverse=True
+        )[:10]
         
-        idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
+        return top_docs
 
-        
-        term_rows = session.execute("SELECT doc_id, tf, doc_length FROM term_index WHERE term = %s", [term])
-
-        
-        for doc_id, tf, doc_length in term_rows:
-            if doc_length is None:
-                doc_row = session.execute("SELECT length FROM document_stats WHERE doc_id = %s", [doc_id]).one()
-                doc_length = doc_row.length if doc_row else avg_dl
-            
-            k1 = 1
-            b = 0.75
-            
-            numerator = tf * (k1 + 1)
-            denominator = tf + k1 * (1 - b + b * safe_divide(doc_length, avg_dl))
-            score = idf * safe_divide(numerator, denominator)
-
-            
-            doc_scores[doc_id] += score
-    
-    top_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)[:10]
-    results = []
-
-    
-    for doc_id, score in top_docs:
-        title_row = session.execute("SELECT title FROM document_stats WHERE doc_id = %s", [doc_id]).one()
-        title = title_row.title if title_row else "Untitled"
-        results.append((doc_id, title, score))
-    
-    return results
+    except Exception as e:
+        print(f"Error in BM25 calculation: {str(e)}", file=sys.stderr)
+        return []
+    finally:
+        if cluster:
+            cluster.shutdown()
 
 def vector_search(query, spark_context):
-    # cluster = Cluster(['localhost'])
-    cluster = Cluster(['cassandra-server'])
-    session = cluster.connect('search_engine')
-    
-    vocab = {}
-    rows = session.execute("SELECT term, term_index FROM vocabulary")
-    for row in rows:
-        vocab[row.term] = row.term_index
-    
-    if not vocab:
-        return []
-    
-    query_terms = [term.lower() for term in query.split()]
-    query_vec = [0.0] * len(vocab)
-    
-    for term in query_terms:
-        if term in vocab:
-            query_vec[vocab[term]] = 1.0
-    
-    query_norm = math.sqrt(sum(x*x for x in query_vec)) or 1.0
-    norm_query = [x/query_norm for x in query_vec]
-    
-    rows = session.execute("SELECT doc_id, title, vector FROM document_stats WHERE vector IS NOT NULL")
-    
-    results = []
-    for doc_id, title, doc_vec in rows:
-        if not doc_vec or len(doc_vec) != len(vocab):
-            continue
-            
-        dot_product = sum(q*d for q,d in zip(norm_query, doc_vec))
-        doc_norm = math.sqrt(sum(d*d for d in doc_vec)) or 1.0
-        cosine_sim = dot_product / doc_norm
+    cluster = None
+    try:
+        cluster = Cluster(
+            ['cassandra-server'],
+            port=9042,
+            connect_timeout=60,
+            idle_heartbeat_interval=30,
+            reconnection_policy=ExponentialReconnectionPolicy(1.0, 30.0),
+            protocol_version=4,
+            control_connection_timeout=60
+        )
+        session = cluster.connect('search_engine')
+        session.default_consistency_level = ConsistencyLevel.ONE
+        session.default_timeout = 60
+
+        session.row_factory = named_tuple_factory
+        vocab_rows = session.execute("SELECT term FROM vocabulary")
         
-        results.append((doc_id, title, cosine_sim))
+        vocab = {row.term: idx for idx, row in enumerate(vocab_rows)}
     
-    return sorted(results, key=lambda x: x[2], reverse=True)[:10]
+        print(f"First vocabulary term: {next(iter(vocab)) if vocab else 'Empty'}")
+
+        if not vocab:
+            return []
+        
+        query_terms = [term.lower() for term in query.split() if term.strip()]
+        query_vec = np.zeros(len(vocab))
+        
+        total_docs = session.execute(
+            "SELECT total_docs FROM corpus_stats WHERE id = 'global'"
+        ).one()[0] or 1
+
+        print(f"Vector total_docs: {total_docs}")
+
+        session.row_factory = tuple_factory
+
+        for term in query_terms:
+            if term in vocab:
+                df_row = session.execute(
+                    "SELECT df FROM vocabulary WHERE term = %s",
+                    [term]
+                ).one()
+                if df_row:
+                    idf = math.log(total_docs / (df_row[0] + 1))
+                    query_vec[vocab[term]] = idf
+        
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm == 0:
+            return []
+        norm_query = query_vec / query_norm
+
+        results = []
+        for doc in session.execute("SELECT doc_id, title, vector FROM document_metadata"):
+            
+            if not doc[2] or len(doc[2]) != len(vocab):
+                continue
+            
+            doc_vec = np.array(doc[2])
+            doc_norm = np.linalg.norm(doc_vec)
+            
+            if doc_norm == 0:
+                continue
+                
+            cosine_sim = np.dot(norm_query, doc_vec) / (query_norm * doc_norm)
+
+            results.append((doc[0], doc[1], float(cosine_sim)))
+        
+        return sorted(results, key=lambda x: x[2], reverse=True)[:10]
+        
+    except Exception as e:
+        print(f"Error in vector search: {str(e)}", file=sys.stderr)
+        return []
+    finally:
+        if cluster:
+            cluster.shutdown()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -105,25 +162,28 @@ if __name__ == "__main__":
         sys.exit(1)
     
     query = " ".join(sys.argv[1:-1] if "--vector" in sys.argv else sys.argv[1:])
-
-    print("Query:", query)
     use_vector = "--vector" in sys.argv
     
     sc = SparkContext(appName="SearchEngineQuery")
     
-    if use_vector:
-        print("Applying vector_search...")
-        results = vector_search(query, sc)
-        print()
-        print("Top 10 relevant documents (Vector Search):", results)
-    else:
-        print("Applying BM25...")
-        results = calculate_bm25(query, sc)
-        print()
-        print("Top 10 relevant documents (BM25):", results)
-    
-    for i, (doc_id, title, score) in enumerate(results, 1):
-        print(f"{i}. Doc ID: {doc_id} | Title: {title} | Score: {score:.4f}")
-    
-    sc.stop()
-    
+    try:
+        if use_vector:
+            print("Applying vector search...")
+            results = vector_search(query, sc)
+            print("Top 10 documents (Vector Search):")
+        else:
+            print("Applying BM25 search")
+            results = calculate_bm25(query, sc)
+            print("Top 10 documents (BM25):")
+        
+        if not results:
+            print("No results found")
+        else:
+            for i, (doc_id, title, score) in enumerate(results, 1):
+                print(f"{i}. Doc ID: {doc_id} | Title: {title} | Score: {score:.4f}")
+                
+    except Exception as e:
+        print(f"Search failed: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        sc.stop()

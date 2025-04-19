@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 import sys
-from collections import defaultdict
 
 current_word = None
-current_count = 0
-doc_ids = []
+documents = []
 
 for line in sys.stdin:
-    word, doc_id, count, length = line.strip().split('\t')
 
-    if not word or not doc_id or not count.isdigit() or not length.isdigit():
-            print(f"Invalid record: {line}", file=sys.stderr)
-            continue
+    parts = line.strip().split('\t')
+
+    if parts[0] == "!META!":
+        print(f"{parts[1]}\t{parts[2]}\t{parts[3]}")
+        continue
+
+    word, doc_id, count, length = line.strip().split('\t')
     
     if word == current_word:
-        current_count += 1
-        doc_ids.append((doc_id, count, length))
+        documents.append((doc_id, count, length))
     else:
         if current_word:
-            print(f"{current_word}\t{current_count}\t{len(doc_ids)}")
-            for doc in doc_ids:
+            for doc in documents:
                 print(f"{current_word}\t{doc[0]}\t{doc[1]}\t{doc[2]}")
         current_word = word
-        current_count = 1
-        doc_ids = [(doc_id, count, length)]
+        documents = [(doc_id, count, length)]
 
 if current_word:
-    print(f"{current_word}\t{current_count}\t{len(doc_ids)}")
-    for doc in doc_ids:
+    for doc in documents:
         print(f"{current_word}\t{doc[0]}\t{doc[1]}\t{doc[2]}")
