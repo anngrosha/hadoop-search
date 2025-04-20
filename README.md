@@ -1,6 +1,4 @@
-*Anna Gromova, DS-01*
-
-*GitHub link:* <https://github.com/anngrosha/hadoop-search>
+# Simple Search Engine
 
 ## Methodology
 
